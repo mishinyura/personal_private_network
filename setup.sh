@@ -6,6 +6,7 @@ CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/config.env}"
 BACKUP_DIR="/root/ikev2-vpn-backup-$(date +%Y%m%d-%H%M%S)"
 
 log() { printf '\n==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 require_root() {
@@ -36,8 +37,20 @@ validate_os() {
   [[ -r /etc/os-release ]] || die "Не удалось определить ОС"
   # shellcheck disable=SC1091
   source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается Ubuntu 24.04"
-  [[ "${VERSION_ID:-}" == "24.04" ]] || die "Поддерживается Ubuntu 24.04, найдена ${VERSION_ID:-unknown}"
+
+  [[ "${ID:-}" == "ubuntu" ]] || die "Установщик рассчитан на Ubuntu, найдена ${PRETTY_NAME:-unknown}"
+
+  case "${VERSION_ID:-}" in
+    22.04|24.04|26.04)
+      log "ОС: ${PRETTY_NAME:-Ubuntu}"
+      ;;
+    25.10)
+      warn "Ubuntu 25.10 больше не рекомендуется: используй поддерживаемую LTS-версию"
+      ;;
+    *)
+      warn "Версия ${PRETTY_NAME:-unknown} не проверялась. Установка продолжится без гарантии совместимости"
+      ;;
+  esac
 }
 
 detect_interface() {
@@ -56,26 +69,119 @@ backup_file() {
 
 install_packages() {
   log "Установка пакетов"
-  apt update
-  DEBIAN_FRONTEND=noninteractive apt install -y \
+  apt-get -o Acquire::Retries=3 update
+  DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y \
     strongswan strongswan-pki strongswan-starter \
     libcharon-extra-plugins libcharon-extauth-plugins \
     certbot dnsutils ufw iptables iproute2 openssl curl
 }
 
+kernel_package_version() {
+  local kernel_package kernel_version module_file
+
+  kernel_package="linux-image-$(uname -r)"
+  kernel_version="$(dpkg-query -W -f='${Version}' "${kernel_package}" 2>/dev/null || true)"
+
+  if [[ -z "${kernel_version}" ]]; then
+    module_file="$(modinfo -n esp4 2>/dev/null || true)"
+    if [[ -n "${module_file}" && -e "${module_file}" ]]; then
+      kernel_package="$(dpkg-query -S "${module_file}" 2>/dev/null | head -n 1 | cut -d: -f1 || true)"
+      kernel_version="$(dpkg-query -W -f='${Version}' "${kernel_package}" 2>/dev/null || true)"
+    fi
+  fi
+
+  printf '%s|%s\n' "${kernel_package}" "${kernel_version}"
+}
+
+kernel_has_dirtyfrag_fix() {
+  local minimum package_info package version
+
+  case "${VERSION_ID:-}" in
+    26.04) minimum="7.0.0-22.22" ;;
+    25.10) minimum="6.17.0-35.35" ;;
+    24.04) minimum="6.8.0-124.124" ;;
+    22.04) minimum="5.15.0-181.191" ;;
+    *) return 2 ;;
+  esac
+
+  package_info="$(kernel_package_version)"
+  package="${package_info%%|*}"
+  version="${package_info#*|}"
+
+  printf 'Kernel: %s\nKernel package: %s\nKernel package version: %s\nRequired Dirty Frag fix: %s\n' \
+    "$(uname -r)" "${package:-unknown}" "${version:-unknown}" "${minimum}"
+
+  [[ -n "${version}" ]] || return 2
+  dpkg --compare-versions "${version}" ge "${minimum}"
+}
+
+enable_esp4_after_security_check() {
+  local dry_run check_status=0
+  dry_run="$(modprobe -n -v esp4 2>&1 || true)"
+
+  if ! grep -Eq '/(usr/)?bin/false' <<< "${dry_run}"; then
+    printf '%s\n' "${dry_run}" >&2
+    die "Не удалось загрузить esp4, но явная Dirty Frag блокировка не найдена"
+  fi
+
+  warn "esp4 заблокирован защитой Dirty Frag. Проверяю версию установленного ядра"
+  kernel_has_dirtyfrag_fix || check_status=$?
+
+  case "${check_status}" in
+    0) ;;
+    1)
+      die "Текущее ядро не содержит исправление Dirty Frag. Выполни apt full-upgrade, перезагрузи сервер и снова запусти setup.sh"
+      ;;
+    *)
+      die "Не удалось надежно проверить исправление Dirty Frag для этого ядра. Автоматически отключать защиту небезопасно"
+      ;;
+  esac
+
+  log "Ядро исправлено. Разрешаю esp4 для IPsec"
+  backup_file /etc/modprobe.d/00-ikev2-enable-esp4.conf
+  cat > /etc/modprobe.d/00-ikev2-enable-esp4.conf <<'EOF_MODPROBE'
+# The provider may block esp4 as a temporary Dirty Frag mitigation.
+# The first install rule wins, so this file is intentionally sorted before dirtyfrag.conf.
+# setup.sh creates it only after verifying a fixed Ubuntu kernel package.
+install esp4 /sbin/modprobe --ignore-install esp4
+EOF_MODPROBE
+
+  dry_run="$(modprobe -n -v esp4 2>&1 || true)"
+  if grep -Eq '/(usr/)?bin/false' <<< "${dry_run}"; then
+    rm -f /etc/modprobe.d/00-ikev2-enable-esp4.conf
+    printf '%s\n' "${dry_run}" >&2
+    die "Блокировка esp4 имеет более высокий приоритет. Нужна ручная проверка файлов modprobe.d"
+  fi
+
+  modprobe esp4 || {
+    modprobe -n -v esp4 >&2 || true
+    die "Не удалось загрузить esp4 после безопасного снятия блокировки"
+  }
+}
+
 check_kernel_modules() {
   log "Проверка модулей ядра"
-  local module
-  for module in xfrm_user xfrm_algo af_key esp4 ah4; do
-    modprobe "${module}" || die "Не удалось загрузить модуль ${module}"
-  done
+
+  modprobe xfrm_user || die "Не удалось загрузить модуль xfrm_user"
+
+  if ! modprobe esp4; then
+    enable_esp4_after_security_check
+  fi
+
+  backup_file /etc/modules-load.d/ikev2-ipsec.conf
+  cat > /etc/modules-load.d/ikev2-ipsec.conf <<'EOF_MODULES'
+xfrm_user
+esp4
+EOF_MODULES
+
+  lsmod | grep -E '^(xfrm_user|xfrm_algo|esp4)[[:space:]]' || true
 }
 
 check_dns() {
   log "Проверка DNS"
   local dns_ip public_ip aaaa
   dns_ip="$(dig +short A "${DOMAIN}" | tail -n 1)"
-  public_ip="$(curl -4 -fsSL https://ifconfig.me)"
+  public_ip="$(curl -4 -fsSL --retry 3 --retry-delay 2 https://ifconfig.me)" || die "Не удалось определить публичный IPv4"
   aaaa="$(dig +short AAAA "${DOMAIN}" | head -n 1 || true)"
 
   printf 'DOMAIN: %s\nDNS A: %s\nPublic IP: %s\n' "${DOMAIN}" "${dns_ip:-not found}" "${public_ip}"
