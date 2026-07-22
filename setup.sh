@@ -32,13 +32,13 @@ load_config() {
   [[ "${LETSENCRYPT_EMAIL}" != "admin@example.com" ]] || die "Замени LETSENCRYPT_EMAIL в config.env"
 }
 
-validate_os() {
-  [[ -r /etc/os-release ]] || die "Не удалось определить ОС"
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается Ubuntu 24.04"
-  [[ "${VERSION_ID:-}" == "24.04" ]] || die "Поддерживается Ubuntu 24.04, найдена ${VERSION_ID:-unknown}"
-}
+# validate_os() {
+#   [[ -r /etc/os-release ]] || die "Не удалось определить ОС"
+#   # shellcheck disable=SC1091
+#   source /etc/os-release
+#   [[ "${ID:-}" == "ubuntu" ]] || die "Поддерживается Ubuntu 24.04"
+#   [[ "${VERSION_ID:-}" == "24.04" ]] || die "Поддерживается Ubuntu 24.04, найдена ${VERSION_ID:-unknown}"
+# }
 
 detect_interface() {
   if [[ "${EXT_IF}" == "auto" || -z "${EXT_IF}" ]]; then
@@ -296,7 +296,7 @@ validate_installation() {
 main() {
   require_root
   load_config
-  validate_os
+  # validate_os
   install_packages
   detect_interface
   check_kernel_modules
